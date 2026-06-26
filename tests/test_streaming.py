@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterator, AsyncIterator
+from typing import Iterator, AsyncIterator, List
 
 import httpx
 import pytest
@@ -214,6 +214,72 @@ async def test_multi_byte_character_multiple_chunks(
     sse = await iter_next(iterator)
     assert sse.event is None
     assert sse.json() == {"content": "известни"}
+
+
+def test_stream_drains_bytes_before_close_after_done(client: OpenAI) -> None:
+    """Stream drains remaining bytes after [DONE] so h11 can return the connection to the pool.
+
+    Regression guard for #3440: breaking on [DONE] without draining iter_bytes() leaves
+    h11 in a non-DONE state, causing httpcore to destroy the connection (TCP FIN) instead
+    of returning it to the pool.
+    """
+    drained: List[bool] = []
+    close_snapshots: List[bool] = []
+
+    def body() -> Iterator[bytes]:
+        yield b"data: [DONE]\n\n"
+        # Bytes that would arrive after [DONE] in real HTTP/1.1 chunked traffic
+        # (the chunked terminator 0\r\n\r\n).  The drain step must consume these.
+        drained.append(True)
+        yield b"0\r\n\r\n"
+
+    response = httpx.Response(200, content=body())
+    orig_close = response.close
+
+    def tracked_close() -> None:
+        # Snapshot whether drain happened at the moment close() is invoked
+        close_snapshots.append(bool(drained))
+        orig_close()
+
+    response.close = tracked_close  # type: ignore[method-assign]
+
+    stream = Stream(cast_to=object, client=client, response=response)
+    for _ in stream:
+        pass  # no events before [DONE]
+
+    assert drained, "trailing bytes were not consumed"
+    # The FIRST close() call must happen after the drain
+    assert close_snapshots, "response.close() was never called"
+    assert close_snapshots[0], "response.close() was called before trailing bytes were drained"
+
+
+@pytest.mark.asyncio
+async def test_async_stream_drains_bytes_before_close_after_done(async_client: AsyncOpenAI) -> None:
+    """AsyncStream drains remaining bytes after [DONE] before closing. See #3440."""
+    drained: List[bool] = []
+    close_snapshots: List[bool] = []
+
+    async def async_body() -> AsyncIterator[bytes]:
+        yield b"data: [DONE]\n\n"
+        drained.append(True)
+        yield b"0\r\n\r\n"
+
+    response = httpx.Response(200, content=async_body())
+    orig_aclose = response.aclose
+
+    async def tracked_aclose() -> None:
+        close_snapshots.append(bool(drained))
+        await orig_aclose()
+
+    response.aclose = tracked_aclose  # type: ignore[method-assign]
+
+    stream = AsyncStream(cast_to=object, client=async_client, response=response)
+    async for _ in stream:
+        pass
+
+    assert drained, "trailing bytes were not consumed"
+    assert close_snapshots, "response.aclose() was never called"
+    assert close_snapshots[0], "response.aclose() was called before trailing bytes were drained"
 
 
 async def to_aiter(iter: Iterator[bytes]) -> AsyncIterator[bytes]:
