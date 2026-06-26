@@ -106,7 +106,17 @@ class Stream(Generic[_T]):
                         response=response,
                     )
         finally:
-            # Ensure the response is closed even if the consumer doesn't read all data
+            # Drain any remaining SSE bytes so that h11 can parse the HTTP/1.1
+            # chunked-encoding terminator (0\r\n\r\n) and advance to DONE state,
+            # returning the connection to the pool instead of destroying it with a
+            # premature TCP FIN.  Without this drain, breaking on [DONE] leaves
+            # iter_bytes() suspended and response.close() takes the destructive path.
+            # Regression introduced by 6132922c; restored by this change (#3440).
+            try:
+                for _ in iterator:
+                    pass
+            except Exception:
+                pass
             response.close()
 
     def __enter__(self) -> Self:
@@ -216,7 +226,15 @@ class AsyncStream(Generic[_T]):
                         response=response,
                     )
         finally:
-            # Ensure the response is closed even if the consumer doesn't read all data
+            # Drain any remaining SSE bytes so that h11 can parse the HTTP/1.1
+            # chunked-encoding terminator (0\r\n\r\n) and advance to DONE state,
+            # returning the connection to the pool instead of destroying it.
+            # See #3440 (regression from 6132922c).
+            try:
+                async for _ in iterator:
+                    pass
+            except Exception:
+                pass
             await response.aclose()
 
     async def __aenter__(self) -> Self:
